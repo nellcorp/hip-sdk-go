@@ -63,10 +63,11 @@ type KeyResolver interface {
 // Client is a HIP SDK client for verifying human identities.
 // Safe for concurrent use.
 type Client struct {
-	httpClient  *http.Client
-	keyResolver KeyResolver
-	apiKey      string
-	jwtSecret   string
+	httpClient      *http.Client
+	keyResolver     KeyResolver
+	apiKey          string
+	jwtSecret       string
+	providerBaseURL string // override for testing/local dev — skips URL derivation from subject ID
 }
 
 // Option configures a Client.
@@ -80,6 +81,14 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithKeyResolver sets a custom key resolver.
 func WithKeyResolver(kr KeyResolver) Option {
 	return func(c *Client) { c.keyResolver = kr }
+}
+
+// WithProviderURL overrides the auto-discovered provider URL.
+// Useful for testing or when the provider uses a non-standard URL.
+// The SDK will POST to {providerURL}/verify instead of deriving
+// the URL from the subject ID.
+func WithProviderURL(url string) Option {
+	return func(c *Client) { c.providerBaseURL = url }
 }
 
 // New creates a HIP SDK client. apiKey and jwtSecret are the credentials
@@ -96,16 +105,26 @@ func New(apiKey, jwtSecret string, opts ...Option) *Client {
 	return c
 }
 
-// Verify sends a verification request to the given provider and verifies
-// the response signature. providerURL is the provider's well-known
-// endpoint (e.g. "https://provider.example.com/.well-known/identity").
+// Verify sends a verification request to the subject's provider and verifies
+// the response signature. The provider URL is derived from the subject ID
+// (e.g. "abc123@provider.example.com" → "https://provider.example.com/.well-known/identity/verify").
 //
-// If subjectID is empty, returns an error. A nonce is generated
-// automatically if not set on the request. A request ID is generated
-// automatically if not set.
-func (c *Client) Verify(ctx context.Context, providerURL string, req VerifyRequest) (*VerifyResponse, error) {
+// A nonce and request ID are generated automatically if not set.
+func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResponse, error) {
 	if req.SubjectID == "" {
 		return nil, fmt.Errorf("hip: subject_id is required")
+	}
+
+	providerID, err := extractProviderFromSubject(req.SubjectID)
+	if err != nil {
+		return nil, err
+	}
+
+	var verifyURL string
+	if c.providerBaseURL != "" {
+		verifyURL = c.providerBaseURL + "/verify"
+	} else {
+		verifyURL = "https://" + providerID + "/.well-known/identity/verify"
 	}
 
 	// Auto-generate nonce and request ID if not provided.
@@ -121,7 +140,7 @@ func (c *Client) Verify(ctx context.Context, providerURL string, req VerifyReque
 		return nil, fmt.Errorf("hip: marshaling request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, providerURL+"/verify", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, verifyURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("hip: creating request: %w", err)
 	}
@@ -156,7 +175,6 @@ func (c *Client) Verify(ctx context.Context, providerURL string, req VerifyReque
 
 	// Verify JWS signature if a key resolver is configured.
 	if c.keyResolver != nil && verifyResp.Signature != "" {
-		providerID := extractProviderID(providerURL)
 		pubKey, keyErr := c.keyResolver.ResolvePublicKey(ctx, providerID)
 		if keyErr != nil {
 			return nil, fmt.Errorf("hip: resolving provider key: %w", keyErr)
@@ -182,23 +200,14 @@ func generateNonce() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// extractProviderID extracts the hostname from a provider URL.
-// e.g. "https://provider.example.com/.well-known/identity" → "provider.example.com"
-func extractProviderID(providerURL string) string {
-	u := providerURL
-	// Strip scheme.
-	if idx := strings.Index(u, "://"); idx >= 0 {
-		u = u[idx+3:]
+// extractProviderFromSubject parses the provider domain from a subject ID.
+// e.g. "abc123@provider.example.com" → "provider.example.com"
+func extractProviderFromSubject(subjectID string) (string, error) {
+	idx := strings.LastIndex(subjectID, "@")
+	if idx < 0 || idx == len(subjectID)-1 {
+		return "", fmt.Errorf("hip: invalid subject_id format, expected {id}@{provider}: %q", subjectID)
 	}
-	// Strip path.
-	if idx := strings.Index(u, "/"); idx >= 0 {
-		u = u[:idx]
-	}
-	// Strip port.
-	if idx := strings.Index(u, ":"); idx >= 0 {
-		u = u[:idx]
-	}
-	return u
+	return subjectID[idx+1:], nil
 }
 
 // --- JWS verification (self-contained, no external deps) ---

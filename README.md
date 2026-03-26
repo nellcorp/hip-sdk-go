@@ -36,15 +36,13 @@ func main() {
         hip.WithKeyResolver(resolver),
     )
 
-    // Verify a human identity.
-    resp, err := client.Verify(context.Background(),
-        "https://provider.example.com/.well-known/identity",
-        hip.VerifyRequest{
-            SubjectID:    "abc123@provider.example.com",
-            Purpose:      "account_creation",
-            MinimumScore: 60,
-        },
-    )
+    // Verify a human identity. The provider URL is auto-discovered
+    // from the subject ID (abc123@provider.example.com → provider.example.com).
+    resp, err := client.Verify(context.Background(), hip.VerifyRequest{
+        SubjectID:    "abc123@provider.example.com",
+        Purpose:      "account_creation",
+        MinimumScore: 60,
+    })
     if err != nil {
         panic(err)
     }
@@ -60,6 +58,7 @@ func main() {
 - **Request ID generation** — UUID v4 auto-generated if not provided
 - **Registry key resolver** with TTL-based caching and last-known-good fallback
 - **Nonce verification** — ensures response nonce matches request
+- **Auto-discovery** — provider URL derived from subject ID (`{id}@{provider}`)
 - Zero external dependencies beyond `github.com/google/uuid`
 
 ## Custom Key Resolver

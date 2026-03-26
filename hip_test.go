@@ -37,7 +37,6 @@ func encodePEMPublicKey(pub ed25519.PublicKey) string {
 	return string(pem.EncodeToMemory(block))
 }
 
-// staticKeyResolver returns a fixed public key for any provider.
 type staticKeyResolver struct {
 	key ed25519.PublicKey
 }
@@ -71,7 +70,6 @@ func TestVerify_Success(t *testing.T) {
 			ExpiresAt:  time.Now().Add(24 * time.Hour),
 		}
 
-		// Sign the response.
 		respWithoutSig := resp
 		payload, _ := json.Marshal(respWithoutSig)
 		resp.Signature = signJWSForTest(t, priv, payload)
@@ -82,11 +80,12 @@ func TestVerify_Success(t *testing.T) {
 	defer srv.Close()
 
 	c := New("test-key", "test-secret",
+		WithProviderURL(srv.URL),
 		WithKeyResolver(&staticKeyResolver{key: pub}),
 	)
 
-	resp, err := c.Verify(context.Background(), srv.URL, VerifyRequest{
-		SubjectID: "abc123",
+	resp, err := c.Verify(context.Background(), VerifyRequest{
+		SubjectID: "abc123@provider.example.com",
 		Purpose:   "account_creation",
 	})
 	if err != nil {
@@ -111,9 +110,9 @@ func TestVerify_NonceMismatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret")
-	_, err := c.Verify(context.Background(), srv.URL, VerifyRequest{
-		SubjectID: "abc123",
+	c := New("key", "secret", WithProviderURL(srv.URL))
+	_, err := c.Verify(context.Background(), VerifyRequest{
+		SubjectID: "abc123@provider.example.com",
 		Nonce:     "my-nonce",
 	})
 	if err == nil || !strings.Contains(err.Error(), "nonce mismatch") {
@@ -123,7 +122,7 @@ func TestVerify_NonceMismatch(t *testing.T) {
 
 func TestVerify_InvalidSignature(t *testing.T) {
 	pub, _ := generateTestKeyPair(t)
-	_, otherPriv := generateTestKeyPair(t) // different key
+	_, otherPriv := generateTestKeyPair(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req VerifyRequest
@@ -136,15 +135,18 @@ func TestVerify_InvalidSignature(t *testing.T) {
 			Nonce:     req.Nonce,
 		}
 		payload, _ := json.Marshal(resp)
-		resp.Signature = signJWSForTest(t, otherPriv, payload) // signed with wrong key
+		resp.Signature = signJWSForTest(t, otherPriv, payload)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret", WithKeyResolver(&staticKeyResolver{key: pub}))
-	_, err := c.Verify(context.Background(), srv.URL, VerifyRequest{SubjectID: "abc123"})
+	c := New("key", "secret",
+		WithProviderURL(srv.URL),
+		WithKeyResolver(&staticKeyResolver{key: pub}),
+	)
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "invalid signature") {
 		t.Fatalf("expected invalid signature error, got %v", err)
 	}
@@ -152,9 +154,17 @@ func TestVerify_InvalidSignature(t *testing.T) {
 
 func TestVerify_MissingSubjectID(t *testing.T) {
 	c := New("key", "secret")
-	_, err := c.Verify(context.Background(), "http://example.com", VerifyRequest{})
+	_, err := c.Verify(context.Background(), VerifyRequest{})
 	if err == nil || !strings.Contains(err.Error(), "subject_id is required") {
 		t.Fatalf("expected subject_id error, got %v", err)
+	}
+}
+
+func TestVerify_InvalidSubjectIDFormat(t *testing.T) {
+	c := New("key", "secret")
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "no-at-sign"})
+	if err == nil || !strings.Contains(err.Error(), "invalid subject_id format") {
+		t.Fatalf("expected format error, got %v", err)
 	}
 }
 
@@ -173,8 +183,8 @@ func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret")
-	_, err := c.Verify(context.Background(), srv.URL, VerifyRequest{SubjectID: "abc123"})
+	c := New("key", "secret", WithProviderURL(srv.URL))
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,10 +203,40 @@ func TestVerify_ProviderError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret")
-	_, err := c.Verify(context.Background(), srv.URL, VerifyRequest{SubjectID: "abc123"})
+	c := New("key", "secret", WithProviderURL(srv.URL))
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected 500 error, got %v", err)
+	}
+}
+
+func TestExtractProviderFromSubject(t *testing.T) {
+	tests := []struct {
+		subject string
+		want    string
+		wantErr bool
+	}{
+		{"abc123@provider.example.com", "provider.example.com", false},
+		{"hex456@hip.dev", "hip.dev", false},
+		{"no-at-sign", "", true},
+		{"trailing@", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.subject, func(t *testing.T) {
+			got, err := extractProviderFromSubject(tt.subject)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -220,26 +260,6 @@ func TestParsePEMPublicKey_Invalid(t *testing.T) {
 	}
 }
 
-func TestExtractProviderID(t *testing.T) {
-	tests := []struct {
-		url  string
-		want string
-	}{
-		{"https://provider.example.com/.well-known/identity", "provider.example.com"},
-		{"https://provider.example.com:8443/.well-known/identity", "provider.example.com"},
-		{"http://localhost:8080/.well-known/identity", "localhost"},
-		{"provider.example.com/.well-known/identity", "provider.example.com"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.url, func(t *testing.T) {
-			got := extractProviderID(tt.url)
-			if got != tt.want {
-				t.Fatalf("extractProviderID(%q) = %q, want %q", tt.url, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestRegistryKeyResolver(t *testing.T) {
 	pub, _ := generateTestKeyPair(t)
 	pemKey := encodePEMPublicKey(pub)
@@ -259,7 +279,7 @@ func TestRegistryKeyResolver(t *testing.T) {
 		t.Fatal("resolved key doesn't match")
 	}
 
-	// Second call should be cached (server can go down).
+	// Second call should be cached.
 	srv.Close()
 	key2, err := resolver.ResolvePublicKey(context.Background(), "test.com")
 	if err != nil {
@@ -280,18 +300,14 @@ func TestRegistryKeyResolver_Fallback(t *testing.T) {
 	}))
 
 	resolver := NewRegistryKeyResolver(srv.URL, 1*time.Millisecond)
-
-	// Populate cache.
 	_, err := resolver.ResolvePublicKey(context.Background(), "fallback.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Kill server, let cache expire.
 	srv.Close()
 	time.Sleep(5 * time.Millisecond)
 
-	// Should fall back to last-known-good.
 	key, err := resolver.ResolvePublicKey(context.Background(), "fallback.com")
 	if err != nil {
 		t.Fatalf("expected fallback, got error: %v", err)
