@@ -70,12 +70,11 @@ func TestVerify_Success(t *testing.T) {
 			ExpiresAt:  time.Now().Add(24 * time.Hour),
 		}
 
-		respWithoutSig := resp
-		payload, _ := json.Marshal(respWithoutSig)
-		resp.Signature = signJWSForTest(t, priv, payload)
+		payload, _ := json.Marshal(resp)
+		jws := signJWSForTest(t, priv, payload)
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
 	}))
 	defer srv.Close()
 
@@ -85,7 +84,7 @@ func TestVerify_Success(t *testing.T) {
 	)
 
 	resp, err := c.Verify(context.Background(), VerifyRequest{
-		SubjectID: "abc123@provider.example.com",
+		SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com",
 		Purpose:   "account_creation",
 	})
 	if err != nil {
@@ -100,19 +99,24 @@ func TestVerify_Success(t *testing.T) {
 }
 
 func TestVerify_NonceMismatch(t *testing.T) {
+	_, priv := generateTestKeyPair(t)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		resp := VerifyResponse{
 			Status: "active",
 			Nonce:  "wrong-nonce",
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		payload, _ := json.Marshal(resp)
+		jws := signJWSForTest(t, priv, payload)
+
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
 	}))
 	defer srv.Close()
 
 	c := New("key", "secret", WithProviderURL(srv.URL))
 	_, err := c.Verify(context.Background(), VerifyRequest{
-		SubjectID: "abc123@provider.example.com",
+		SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com",
 		Nonce:     "my-nonce",
 	})
 	if err == nil || !strings.Contains(err.Error(), "nonce mismatch") {
@@ -135,10 +139,11 @@ func TestVerify_InvalidSignature(t *testing.T) {
 			Nonce:     req.Nonce,
 		}
 		payload, _ := json.Marshal(resp)
-		resp.Signature = signJWSForTest(t, otherPriv, payload)
+		// Sign with wrong key to cause signature verification to fail
+		jws := signJWSForTest(t, otherPriv, payload)
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
 	}))
 	defer srv.Close()
 
@@ -146,7 +151,7 @@ func TestVerify_InvalidSignature(t *testing.T) {
 		WithProviderURL(srv.URL),
 		WithKeyResolver(&staticKeyResolver{key: pub}),
 	)
-	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "invalid signature") {
 		t.Fatalf("expected invalid signature error, got %v", err)
 	}
@@ -169,6 +174,8 @@ func TestVerify_InvalidSubjectIDFormat(t *testing.T) {
 }
 
 func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
+	_, priv := generateTestKeyPair(t)
+
 	var receivedReq VerifyRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&receivedReq)
@@ -177,14 +184,19 @@ func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
 			SubjectID: receivedReq.SubjectID,
 			Status:    "active",
 			Nonce:     receivedReq.Nonce,
+			IssuedAt:  time.Now(),
+			ExpiresAt: time.Now().Add(24 * time.Hour),
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		payload, _ := json.Marshal(resp)
+		jws := signJWSForTest(t, priv, payload)
+
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
 	}))
 	defer srv.Close()
 
 	c := New("key", "secret", WithProviderURL(srv.URL))
-	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -204,7 +216,7 @@ func TestVerify_ProviderError(t *testing.T) {
 	defer srv.Close()
 
 	c := New("key", "secret", WithProviderURL(srv.URL))
-	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "abc123@provider.example.com"})
+	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected 500 error, got %v", err)
 	}
@@ -216,10 +228,17 @@ func TestExtractProviderFromSubject(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"abc123@provider.example.com", "provider.example.com", false},
-		{"hex456@hip.dev", "hip.dev", false},
+		// Valid format: {derived_id}@id.{provider_domain}
+		{"xK7mN2pR9sT4vW6yB@id.humanidentity.io", "humanidentity.io", false},
+		{"abc123def456@id.hip.dev", "hip.dev", false},
+		{"short@id.example.com", "example.com", false},
+		// Missing id. prefix
+		{"abc123@provider.example.com", "", true},
+		{"hex456@hip.dev", "", true},
+		// Invalid format
 		{"no-at-sign", "", true},
 		{"trailing@", "", true},
+		{"trailing@id.", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.subject, func(t *testing.T) {

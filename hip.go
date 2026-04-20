@@ -60,6 +60,13 @@ type ScoreComponents struct {
 	ActiveFlags         []string `json:"active_flags"`
 }
 
+// ExchangeRequest is sent by platforms to exchange a signup code for subject_id + verification.
+type ExchangeRequest struct {
+	SignupCode string `json:"signup_code"`
+	RequestID  string `json:"request_id"`
+	Nonce      string `json:"nonce"`
+}
+
 // KeyResolver fetches a provider's Ed25519 public key (PEM-encoded).
 // The SDK ships with RegistryKeyResolver for production use, but
 // callers can provide their own for testing or custom key management.
@@ -228,6 +235,97 @@ func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, 
 	return result, nil
 }
 
+// ExchangeSignupCode exchanges a user's signup code for their subject_id and verification.
+// This is used during platform signup when the user provides their HIP signup code.
+// The signup code is single-use and expires after 1 hour.
+//
+// Unlike Verify, this method requires the provider URL to be set via WithProviderURL
+// since the signup code does not contain provider information.
+//
+// A nonce and request ID are generated automatically if not set.
+func (c *Client) ExchangeSignupCode(ctx context.Context, req ExchangeRequest) (*VerifyResult, error) {
+	if req.SignupCode == "" {
+		return nil, fmt.Errorf("hip: signup_code is required")
+	}
+
+	if c.providerBaseURL == "" {
+		return nil, fmt.Errorf("hip: provider URL is required for exchange (use WithProviderURL)")
+	}
+
+	exchangeURL := c.providerBaseURL + "/exchange"
+
+	// Auto-generate nonce and request ID if not provided.
+	if req.Nonce == "" {
+		req.Nonce = generateNonce()
+	}
+	if req.RequestID == "" {
+		req.RequestID = uuid.New().String()
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("hip: marshaling request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, exchangeURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("hip: creating request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.jwtSecret)
+	httpReq.Header.Set("X-API-Key", c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("hip: sending request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max
+	if err != nil {
+		return nil, fmt.Errorf("hip: reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hip: provider returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Response body is a JWS compact serialization.
+	jwsToken := strings.TrimSpace(string(respBody))
+
+	result := &VerifyResult{}
+
+	// Decode payload without signature verification for exchange (no providerID).
+	parts := strings.SplitN(jwsToken, ".", 4)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("hip: malformed JWS: expected 3 parts, got %d", len(parts))
+	}
+	payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+	if decErr != nil {
+		return nil, fmt.Errorf("hip: decoding JWS payload: %w", decErr)
+	}
+	if err := json.Unmarshal(payload, &result.VerifyResponse); err != nil {
+		return nil, fmt.Errorf("hip: decoding response: %w", err)
+	}
+
+	// Verify nonce matches.
+	if result.Nonce != req.Nonce {
+		return nil, fmt.Errorf("hip: nonce mismatch: sent %q, got %q", req.Nonce, result.Nonce)
+	}
+
+	// Verify request ID matches.
+	if result.RequestID != req.RequestID {
+		return nil, fmt.Errorf("hip: request_id mismatch: sent %q, got %q", req.RequestID, result.RequestID)
+	}
+
+	// Verify attestation has not expired.
+	if time.Now().After(result.ExpiresAt) {
+		return nil, fmt.Errorf("hip: attestation expired at %v", result.ExpiresAt)
+	}
+
+	return result, nil
+}
+
 // resolveKeyWithStaleFlag wraps the key resolver and tracks whether a stale
 // cache entry was used as a fallback.
 func (c *Client) resolveKeyWithStaleFlag(ctx context.Context, providerID string) (ed25519.PublicKey, bool, error) {
@@ -248,13 +346,23 @@ func generateNonce() string {
 }
 
 // extractProviderFromSubject parses the provider domain from a subject ID.
-// e.g. "abc123@provider.example.com" → "provider.example.com"
+// Expected format: {derived_id}@id.{provider_domain}
+// e.g. "xK7mN2pR9sT4vW6yB@id.humanidentity.io" → "humanidentity.io"
+// The "id." prefix is a namespace marker preventing collision with real emails.
 func extractProviderFromSubject(subjectID string) (string, error) {
 	idx := strings.LastIndex(subjectID, "@")
 	if idx < 0 || idx == len(subjectID)-1 {
-		return "", fmt.Errorf("hip: invalid subject_id format, expected {id}@{provider}: %q", subjectID)
+		return "", fmt.Errorf("hip: invalid subject_id format: %q", subjectID)
 	}
-	return subjectID[idx+1:], nil
+	host := subjectID[idx+1:]
+	if !strings.HasPrefix(host, "id.") {
+		return "", fmt.Errorf("hip: missing id. prefix: %q", subjectID)
+	}
+	providerDomain := strings.TrimPrefix(host, "id.")
+	if providerDomain == "" {
+		return "", fmt.Errorf("hip: empty provider_domain: %q", subjectID)
+	}
+	return providerDomain, nil
 }
 
 // --- JWS verification (self-contained, no external deps) ---
