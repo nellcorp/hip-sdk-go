@@ -78,7 +78,7 @@ func TestVerify_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("test-key", "test-secret",
+	c := New("test-key",
 		WithProviderURL(srv.URL),
 		WithKeyResolver(&staticKeyResolver{key: pub}),
 	)
@@ -114,7 +114,7 @@ func TestVerify_NonceMismatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret", WithProviderURL(srv.URL))
+	c := New("key", WithProviderURL(srv.URL))
 	_, err := c.Verify(context.Background(), VerifyRequest{
 		SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com",
 		Nonce:     "my-nonce",
@@ -147,7 +147,7 @@ func TestVerify_InvalidSignature(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret",
+	c := New("key",
 		WithProviderURL(srv.URL),
 		WithKeyResolver(&staticKeyResolver{key: pub}),
 	)
@@ -158,7 +158,7 @@ func TestVerify_InvalidSignature(t *testing.T) {
 }
 
 func TestVerify_MissingSubjectID(t *testing.T) {
-	c := New("key", "secret")
+	c := New("key")
 	_, err := c.Verify(context.Background(), VerifyRequest{})
 	if err == nil || !strings.Contains(err.Error(), "subject_id is required") {
 		t.Fatalf("expected subject_id error, got %v", err)
@@ -166,7 +166,7 @@ func TestVerify_MissingSubjectID(t *testing.T) {
 }
 
 func TestVerify_InvalidSubjectIDFormat(t *testing.T) {
-	c := New("key", "secret")
+	c := New("key")
 	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "no-at-sign"})
 	if err == nil || !strings.Contains(err.Error(), "invalid subject_id format") {
 		t.Fatalf("expected format error, got %v", err)
@@ -195,7 +195,7 @@ func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret", WithProviderURL(srv.URL))
+	c := New("key", WithProviderURL(srv.URL))
 	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -215,7 +215,7 @@ func TestVerify_ProviderError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New("key", "secret", WithProviderURL(srv.URL))
+	c := New("key", WithProviderURL(srv.URL))
 	_, err := c.Verify(context.Background(), VerifyRequest{SubjectID: "xK7mN2pR9sT4vW6yB@id.provider.example.com"})
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected 500 error, got %v", err)

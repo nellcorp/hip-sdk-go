@@ -80,7 +80,6 @@ type Client struct {
 	httpClient      *http.Client
 	keyResolver     KeyResolver
 	apiKey          string
-	jwtSecret       string
 	providerBaseURL string // override for testing/local dev — skips URL derivation from subject ID
 }
 
@@ -105,13 +104,13 @@ func WithProviderURL(url string) Option {
 	return func(c *Client) { c.providerBaseURL = url }
 }
 
-// New creates a HIP SDK client. apiKey and jwtSecret are the credentials
-// returned when the platform registered with a HIP provider.
-func New(apiKey, jwtSecret string, opts ...Option) *Client {
+// New creates a HIP SDK client. apiKey is the `hip_sk_…` secret issued by the
+// provider for the platform. The SDK sends it as a Bearer token on every
+// request; the provider derives the platform from the key.
+func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 		apiKey:     apiKey,
-		jwtSecret:  jwtSecret,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -163,8 +162,7 @@ func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, 
 		return nil, fmt.Errorf("hip: creating request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.jwtSecret)
-	httpReq.Header.Set("X-API-Key", c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -272,8 +270,7 @@ func (c *Client) ExchangeSignupCode(ctx context.Context, req ExchangeRequest) (*
 		return nil, fmt.Errorf("hip: creating request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.jwtSecret)
-	httpReq.Header.Set("X-API-Key", c.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

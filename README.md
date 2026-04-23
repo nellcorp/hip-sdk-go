@@ -29,10 +29,9 @@ func main() {
         24*time.Hour,
     )
 
-    // Create a client with your platform credentials.
+    // Create a client with your platform API key (hip_sk_…).
     client := hip.New(
-        "your-api-key",
-        "your-jwt-secret",
+        "hip_sk_your_api_key",
         hip.WithKeyResolver(resolver),
     )
 
