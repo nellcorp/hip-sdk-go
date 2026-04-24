@@ -9,23 +9,22 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // VerifyRequest is sent by platforms to verify a human.
 type VerifyRequest struct {
 	SubjectID    string `json:"subject_id"`
-	RequestID    string `json:"request_id"`
 	MinimumScore int    `json:"minimum_score,omitempty"`
 	Purpose      string `json:"purpose,omitempty"`
 	Nonce        string `json:"nonce"`
@@ -33,7 +32,6 @@ type VerifyRequest struct {
 
 // VerifyResponse is the provider's signed response.
 type VerifyResponse struct {
-	RequestID              string          `json:"request_id"`
 	SubjectID              string          `json:"subject_id"`
 	Status                 string          `json:"status"`
 	Score                  int             `json:"score"`
@@ -63,7 +61,6 @@ type ScoreComponents struct {
 // ExchangeRequest is sent by platforms to exchange a signup code for subject_id + verification.
 type ExchangeRequest struct {
 	SignupCode string `json:"signup_code"`
-	RequestID  string `json:"request_id"`
 	Nonce      string `json:"nonce"`
 }
 
@@ -144,12 +141,9 @@ func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, 
 		verifyURL = "https://" + providerID + "/.well-known/hip/verify"
 	}
 
-	// Auto-generate nonce and request ID if not provided.
+	// Auto-generate nonce if not provided.
 	if req.Nonce == "" {
 		req.Nonce = generateNonce()
-	}
-	if req.RequestID == "" {
-		req.RequestID = uuid.New().String()
 	}
 
 	body, err := json.Marshal(req)
@@ -220,11 +214,6 @@ func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, 
 		return nil, fmt.Errorf("hip: nonce mismatch: sent %q, got %q", req.Nonce, result.Nonce)
 	}
 
-	// Verify request ID matches.
-	if result.RequestID != req.RequestID {
-		return nil, fmt.Errorf("hip: request_id mismatch: sent %q, got %q", req.RequestID, result.RequestID)
-	}
-
 	// Verify attestation has not expired.
 	if time.Now().After(result.ExpiresAt) {
 		return nil, fmt.Errorf("hip: attestation expired at %v", result.ExpiresAt)
@@ -252,12 +241,9 @@ func (c *Client) ExchangeSignupCode(ctx context.Context, req ExchangeRequest) (*
 
 	exchangeURL := c.providerBaseURL + "/exchange"
 
-	// Auto-generate nonce and request ID if not provided.
+	// Auto-generate nonce if not provided.
 	if req.Nonce == "" {
 		req.Nonce = generateNonce()
-	}
-	if req.RequestID == "" {
-		req.RequestID = uuid.New().String()
 	}
 
 	body, err := json.Marshal(req)
@@ -310,17 +296,184 @@ func (c *Client) ExchangeSignupCode(ctx context.Context, req ExchangeRequest) (*
 		return nil, fmt.Errorf("hip: nonce mismatch: sent %q, got %q", req.Nonce, result.Nonce)
 	}
 
-	// Verify request ID matches.
-	if result.RequestID != req.RequestID {
-		return nil, fmt.Errorf("hip: request_id mismatch: sent %q, got %q", req.RequestID, result.RequestID)
-	}
-
 	// Verify attestation has not expired.
 	if time.Now().After(result.ExpiresAt) {
 		return nil, fmt.Errorf("hip: attestation expired at %v", result.ExpiresAt)
 	}
 
 	return result, nil
+}
+
+// OAuthStartOptions configures StartOAuth.
+type OAuthStartOptions struct {
+	// ProviderDomain is the HIP provider's domain (e.g. "humanidentity.io").
+	ProviderDomain string
+	// ClientID is the platform's canonical_platform_id.
+	ClientID string
+	// RedirectURI must be a URI registered on the platform.
+	RedirectURI string
+	// State is an opaque CSRF token echoed back on the redirect.
+	State string
+}
+
+// OAuthFlow is returned by StartOAuth. AuthorizeURL is where to redirect the
+// user's browser. Verifier is the PKCE code_verifier — caller MUST retain it
+// (typically in session storage) until CompleteOAuth.
+type OAuthFlow struct {
+	AuthorizeURL string
+	Verifier     string
+}
+
+// OAuthTokenResponse is returned from CompleteOAuth.
+type OAuthTokenResponse struct {
+	SubjectID   string `json:"subject_id"`
+	Status      string `json:"status"`
+	Score       int    `json:"score"`
+	ScoreState  string `json:"score_state"`
+	Attestation string `json:"attestation"` // JWS compact
+	IssuedAt    string `json:"issued_at"`
+	ExpiresAt   string `json:"expires_at"`
+}
+
+// StartOAuth generates a PKCE verifier/challenge pair and returns the
+// authorize URL to send the user to.
+//
+//	flow, err := c.StartOAuth(hip.OAuthStartOptions{
+//	    ProviderDomain: "humanidentity.io",
+//	    ClientID:       "my-platform.example.com",
+//	    RedirectURI:    "https://my-platform.example.com/oauth/callback",
+//	    State:          "csrf-token",
+//	})
+//	// save flow.Verifier in the user's session
+//	// redirect to flow.AuthorizeURL
+func (c *Client) StartOAuth(opts OAuthStartOptions) (*OAuthFlow, error) {
+	if opts.ClientID == "" {
+		return nil, fmt.Errorf("hip: ClientID is required")
+	}
+	if opts.RedirectURI == "" {
+		return nil, fmt.Errorf("hip: RedirectURI is required")
+	}
+	base := c.providerBaseURL
+	if base == "" {
+		if opts.ProviderDomain == "" {
+			return nil, fmt.Errorf("hip: ProviderDomain is required (or configure the client with WithProviderURL)")
+		}
+		base = "https://" + opts.ProviderDomain
+	}
+	// `base` points at the provider root; /oauth/authorize lives alongside /.well-known/hip.
+	// If the caller supplied a /.well-known/hip URL via WithProviderURL, strip it.
+	base = strings.TrimSuffix(base, "/.well-known/hip")
+	base = strings.TrimSuffix(base, "/")
+
+	verifier, err := generateCodeVerifier()
+	if err != nil {
+		return nil, fmt.Errorf("hip: generating code_verifier: %w", err)
+	}
+	challenge := codeChallenge(verifier)
+
+	q := url.Values{}
+	q.Set("client_id", opts.ClientID)
+	q.Set("redirect_uri", opts.RedirectURI)
+	q.Set("response_type", "code")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	if opts.State != "" {
+		q.Set("state", opts.State)
+	}
+
+	return &OAuthFlow{
+		AuthorizeURL: base + "/oauth/authorize?" + q.Encode(),
+		Verifier:     verifier,
+	}, nil
+}
+
+// CompleteOAuth exchanges an authorization code + PKCE verifier for a
+// verification attestation. The platform is authenticated by client_id + PKCE;
+// no Bearer header is sent on this request.
+//
+//	resp, err := c.CompleteOAuth(ctx, code, verifier, hip.CompleteOAuthOptions{
+//	    ProviderDomain: "humanidentity.io",
+//	    ClientID:       "my-platform.example.com",
+//	})
+func (c *Client) CompleteOAuth(ctx context.Context, code, verifier string, opts CompleteOAuthOptions) (*OAuthTokenResponse, error) {
+	if code == "" {
+		return nil, fmt.Errorf("hip: code is required")
+	}
+	if verifier == "" {
+		return nil, fmt.Errorf("hip: verifier is required")
+	}
+	if opts.ClientID == "" {
+		return nil, fmt.Errorf("hip: ClientID is required")
+	}
+	base := c.providerBaseURL
+	if base == "" {
+		if opts.ProviderDomain == "" {
+			return nil, fmt.Errorf("hip: ProviderDomain is required")
+		}
+		base = "https://" + opts.ProviderDomain
+	}
+	base = strings.TrimSuffix(base, "/.well-known/hip")
+	base = strings.TrimSuffix(base, "/")
+
+	body, err := json.Marshal(map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"client_id":     opts.ClientID,
+		"code_verifier": verifier,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hip: marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/oauth/token", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("hip: creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// NOTE: /oauth/token does not accept an Authorization header. PKCE +
+	// client_id are the platform authentication.
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("hip: sending request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("hip: reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hip: provider returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var out OAuthTokenResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("hip: decoding response: %w", err)
+	}
+	return &out, nil
+}
+
+// CompleteOAuthOptions configures CompleteOAuth.
+type CompleteOAuthOptions struct {
+	ProviderDomain string
+	ClientID       string
+}
+
+// generateCodeVerifier returns a 128-character base64url PKCE verifier
+// (96 random bytes encoded).
+func generateCodeVerifier() (string, error) {
+	b := make([]byte, 96)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// codeChallenge returns base64url(SHA-256(verifier)) per RFC 7636 §4.2.
+func codeChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // resolveKeyWithStaleFlag wraps the key resolver and tracks whether a stale

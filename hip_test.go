@@ -60,7 +60,6 @@ func TestVerify_Success(t *testing.T) {
 		}
 
 		resp := VerifyResponse{
-			RequestID:  req.RequestID,
 			SubjectID:  req.SubjectID,
 			Status:     "active",
 			Score:      95,
@@ -133,7 +132,6 @@ func TestVerify_InvalidSignature(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		resp := VerifyResponse{
-			RequestID: req.RequestID,
 			SubjectID: req.SubjectID,
 			Status:    "active",
 			Nonce:     req.Nonce,
@@ -173,14 +171,13 @@ func TestVerify_InvalidSubjectIDFormat(t *testing.T) {
 	}
 }
 
-func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
+func TestVerify_AutoGeneratesNonce(t *testing.T) {
 	_, priv := generateTestKeyPair(t)
 
 	var receivedReq VerifyRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&receivedReq)
 		resp := VerifyResponse{
-			RequestID: receivedReq.RequestID,
 			SubjectID: receivedReq.SubjectID,
 			Status:    "active",
 			Nonce:     receivedReq.Nonce,
@@ -202,9 +199,6 @@ func TestVerify_AutoGeneratesNonceAndRequestID(t *testing.T) {
 	}
 	if receivedReq.Nonce == "" {
 		t.Fatal("expected auto-generated nonce")
-	}
-	if receivedReq.RequestID == "" {
-		t.Fatal("expected auto-generated request ID")
 	}
 }
 
@@ -333,5 +327,90 @@ func TestRegistryKeyResolver_Fallback(t *testing.T) {
 	}
 	if !pub.Equal(key) {
 		t.Fatal("fallback key doesn't match")
+	}
+}
+
+// --- OAuth / PKCE ---
+
+func TestStartOAuth(t *testing.T) {
+	c := New("key")
+	flow, err := c.StartOAuth(OAuthStartOptions{
+		ProviderDomain: "provider.example.com",
+		ClientID:       "my-platform",
+		RedirectURI:    "https://my-platform.example.com/oauth/callback",
+		State:          "csrf123",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if flow.Verifier == "" || len(flow.Verifier) != 128 {
+		t.Errorf("verifier length = %d, want 128", len(flow.Verifier))
+	}
+	if !strings.HasPrefix(flow.AuthorizeURL, "https://provider.example.com/oauth/authorize?") {
+		t.Errorf("unexpected authorize URL: %s", flow.AuthorizeURL)
+	}
+	if !strings.Contains(flow.AuthorizeURL, "code_challenge=") {
+		t.Errorf("missing code_challenge in URL: %s", flow.AuthorizeURL)
+	}
+	if !strings.Contains(flow.AuthorizeURL, "code_challenge_method=S256") {
+		t.Errorf("missing S256 method: %s", flow.AuthorizeURL)
+	}
+	if !strings.Contains(flow.AuthorizeURL, "state=csrf123") {
+		t.Errorf("missing state: %s", flow.AuthorizeURL)
+	}
+}
+
+func TestStartOAuth_MissingClientID(t *testing.T) {
+	c := New("key")
+	_, err := c.StartOAuth(OAuthStartOptions{RedirectURI: "https://x/cb"})
+	if err == nil || !strings.Contains(err.Error(), "ClientID") {
+		t.Fatalf("expected ClientID error, got %v", err)
+	}
+}
+
+func TestCodeChallenge_RFC7636TestVector(t *testing.T) {
+	// RFC 7636 Appendix B.
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	want := "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+	got := codeChallenge(verifier)
+	if got != want {
+		t.Errorf("codeChallenge(%q) = %q, want %q", verifier, got, want)
+	}
+}
+
+func TestCompleteOAuth(t *testing.T) {
+	var receivedBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("Authorization header must NOT be sent; got %q", r.Header.Get("Authorization"))
+		}
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"subject_id":"sid","status":"active","score":95,"score_state":"stable","attestation":"a.b.c","issued_at":"2026-04-24T00:00:00Z","expires_at":"2026-04-24T00:05:00Z"}`))
+	}))
+	defer srv.Close()
+
+	c := New("shouldNotBeSent", WithProviderURL(srv.URL))
+	resp, err := c.CompleteOAuth(context.Background(), "the-code", "the-verifier-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", CompleteOAuthOptions{
+		ProviderDomain: "provider.example.com",
+		ClientID:       "my-platform",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.SubjectID != "sid" {
+		t.Errorf("subject_id = %q", resp.SubjectID)
+	}
+	if receivedBody["grant_type"] != "authorization_code" {
+		t.Errorf("grant_type = %q", receivedBody["grant_type"])
+	}
+	if receivedBody["code"] != "the-code" {
+		t.Errorf("code = %q", receivedBody["code"])
+	}
+	if receivedBody["client_id"] != "my-platform" {
+		t.Errorf("client_id = %q", receivedBody["client_id"])
+	}
+	if receivedBody["code_verifier"] != "the-verifier-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" {
+		t.Errorf("code_verifier = %q", receivedBody["code_verifier"])
 	}
 }
