@@ -83,18 +83,18 @@ type KeyResolver interface {
 // ProviderEntry is the HIP/1.1 registry shape for a provider entry. The SDK
 // reads protocol endpoint URLs from this struct via the accessor methods.
 type ProviderEntry struct {
-	ID                     string             `json:"id"`
-	DisplayName            string             `json:"display_name"`
-	Domain                 string             `json:"domain"`
-	Tier                   string             `json:"tier"`
-	Status                 string             `json:"status"`
-	PublicKey              string             `json:"public_key"`
-	CertificateFingerprint string             `json:"certificate_fingerprint"`
-	Endpoints              ProviderEndpoints  `json:"endpoints"`
-	Apps                   ProviderApps       `json:"apps,omitempty"`
-	PeerRegistries         []string           `json:"peer_registries,omitempty"`
-	WellKnownURL           string             `json:"well_known_url,omitempty"` // DEPRECATED — removed in HIP/1.3
-	EntrySignature         string             `json:"entry_signature,omitempty"`
+	ID                     string            `json:"id"`
+	DisplayName            string            `json:"display_name"`
+	Domain                 string            `json:"domain"`
+	Tier                   string            `json:"tier"`
+	Status                 string            `json:"status"`
+	PublicKey              string            `json:"public_key"`
+	CertificateFingerprint string            `json:"certificate_fingerprint"`
+	Endpoints              ProviderEndpoints `json:"endpoints"`
+	Apps                   ProviderApps      `json:"apps,omitempty"`
+	PeerRegistries         []string          `json:"peer_registries,omitempty"`
+	WellKnownURL           string            `json:"well_known_url,omitempty"` // DEPRECATED — removed in HIP/1.3
+	EntrySignature         string            `json:"entry_signature,omitempty"`
 }
 
 // ProviderEndpoints lists the HIP/1.1 protocol surfaces.
@@ -766,9 +766,9 @@ type RegistryKeyResolver struct {
 	httpClient  *http.Client
 	ttl         time.Duration
 
-	mu             sync.RWMutex
-	cache          map[string]*cachedKey
-	providerCache  map[string]*cachedProvider
+	mu            sync.RWMutex
+	cache         map[string]*cachedKey
+	providerCache map[string]*cachedProvider
 }
 
 type cachedKey struct {
