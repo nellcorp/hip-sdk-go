@@ -224,11 +224,11 @@ func TestExtractProviderFromSubject(t *testing.T) {
 	}{
 		// Valid format: {derived_id}@id.{provider_domain}
 		{"xK7mN2pR9sT4vW6yB@id.humanidentity.io", "humanidentity.io", false},
-		{"abc123def456@id.hip.dev", "hip.dev", false},
+		{"abc123def456@id.humanidentity.io", "humanidentity.io", false},
 		{"short@id.example.com", "example.com", false},
 		// Missing id. prefix
 		{"abc123@provider.example.com", "", true},
-		{"hex456@hip.dev", "", true},
+		{"hex456@humanidentity.io", "", true},
 		// Invalid format
 		{"no-at-sign", "", true},
 		{"trailing@", "", true},

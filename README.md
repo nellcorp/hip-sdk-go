@@ -25,7 +25,7 @@ func main() {
     // Key resolver fetches provider public keys from the registry
     // with 24h caching and last-known-good fallback.
     resolver := hip.NewRegistryKeyResolver(
-        "https://registry.hip.dev",
+        "https://registry.humanidentity.io",
         24*time.Hour,
     )
 
