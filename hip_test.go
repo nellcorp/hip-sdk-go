@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -413,4 +415,185 @@ func TestCompleteOAuth(t *testing.T) {
 	if receivedBody["code_verifier"] != "the-verifier-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" {
 		t.Errorf("code_verifier = %q", receivedBody["code_verifier"])
 	}
+}
+
+// --- HIP/1.1 registry-driven discovery ---
+
+// staticProviderResolver returns a fixed ProviderEntry without hitting the network.
+type staticProviderResolver struct {
+	entry *ProviderEntry
+}
+
+func (r *staticProviderResolver) ResolvePublicKey(ctx context.Context, providerID string) (ed25519.PublicKey, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (r *staticProviderResolver) ResolveProvider(ctx context.Context, providerID string) (*ProviderEntry, error) {
+	if r.entry == nil || r.entry.ID != providerID {
+		return nil, errors.New("not found")
+	}
+	entry := *r.entry
+	return &entry, nil
+}
+
+// pemEncodePublicKey is a test-local helper. The SDK does not export PEM encoding.
+func pemEncodePublicKey(t *testing.T, pub ed25519.PublicKey) string {
+	t.Helper()
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
+
+func TestProviderEntry_VerifyURLAccessor(t *testing.T) {
+	cases := []struct {
+		name string
+		p    ProviderEntry
+		want string
+	}{
+		{
+			"hip/1.1 endpoints win",
+			ProviderEntry{
+				Endpoints:    ProviderEndpoints{Verify: "https://api.example.com/.well-known/hip/verify"},
+				WellKnownURL: "https://example.com/.well-known/hip/", // ignored
+			},
+			"https://api.example.com/.well-known/hip/verify",
+		},
+		{
+			"hip/1.0 fallback derives from well_known_url",
+			ProviderEntry{WellKnownURL: "https://example.com/.well-known/hip/"},
+			"https://example.com/.well-known/hip/verify",
+		},
+		{"empty entry", ProviderEntry{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.p.VerifyURL(); got != tc.want {
+				t.Errorf("VerifyURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVerify_UsesRegistryDiscoveredEndpoints(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/hip/verify" {
+			t.Errorf("Verify path = %q, want /.well-known/hip/verify", r.URL.Path)
+		}
+		var req VerifyRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		payload, _ := json.Marshal(VerifyResponse{
+			SubjectID: req.SubjectID, Status: "active", Score: 80, Nonce: req.Nonce,
+			IssuedAt:  time.Now(),
+			ExpiresAt: time.Now().Add(5 * time.Minute),
+		})
+		jws := signJWSForTest(t, priv, payload)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
+	}))
+	defer apiSrv.Close()
+
+	resolver := &staticProviderResolver{entry: &ProviderEntry{
+		ID:        "provider.example.com",
+		PublicKey: pemEncodePublicKey(t, pub),
+		Endpoints: ProviderEndpoints{
+			Verify: apiSrv.URL + "/.well-known/hip/verify",
+		},
+	}}
+
+	c := New("key",
+		WithKeyResolver(&staticKeyResolver{key: pub}),
+		WithProviderResolverForTest(resolver),
+	)
+	resp, err := c.Verify(context.Background(), VerifyRequest{
+		SubjectID: "xK7m@id.provider.example.com",
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if resp.Score != 80 {
+		t.Errorf("score = %d", resp.Score)
+	}
+}
+
+func TestStartOAuth_UsesRegistryDiscoveredAuthorizeURL(t *testing.T) {
+	resolver := &staticProviderResolver{entry: &ProviderEntry{
+		ID: "provider.example.com",
+		Endpoints: ProviderEndpoints{
+			OAuthAuthorize: "https://identity.example.com/oauth/authorize",
+			OAuthToken:     "https://api.example.com/oauth/token",
+		},
+	}}
+	c := New("key",
+		WithKeyResolver(&staticKeyResolver{key: ed25519.PublicKey(make([]byte, 32))}),
+		WithProviderResolverForTest(resolver),
+	)
+	flow, err := c.StartOAuthCtx(context.Background(), OAuthStartOptions{
+		ProviderDomain: "provider.example.com",
+		ClientID:       "my-platform",
+		RedirectURI:    "https://platform.example.com/cb",
+		State:          "csrf",
+	})
+	if err != nil {
+		t.Fatalf("StartOAuthCtx: %v", err)
+	}
+	if !strings.HasPrefix(flow.AuthorizeURL, "https://identity.example.com/oauth/authorize?") {
+		t.Errorf("AuthorizeURL = %q (must start with identity host, not provider domain)", flow.AuthorizeURL)
+	}
+}
+
+func TestStartOAuth_HIP10FallbackWhenNoRegistryEntry(t *testing.T) {
+	resolver := &staticProviderResolver{entry: nil}
+	c := New("key",
+		WithKeyResolver(&staticKeyResolver{key: ed25519.PublicKey(make([]byte, 32))}),
+		WithProviderResolverForTest(resolver),
+	)
+	flow, err := c.StartOAuthCtx(context.Background(), OAuthStartOptions{
+		ProviderDomain: "provider.example.com",
+		ClientID:       "my-platform",
+		RedirectURI:    "https://platform.example.com/cb",
+	})
+	if err != nil {
+		t.Fatalf("StartOAuthCtx: %v", err)
+	}
+	if !strings.HasPrefix(flow.AuthorizeURL, "https://provider.example.com/oauth/authorize?") {
+		t.Errorf("AuthorizeURL = %q (HIP/1.0 fallback expected)", flow.AuthorizeURL)
+	}
+}
+
+func TestNew_AutoCreatesRegistryResolverByDefault(t *testing.T) {
+	c := New("key")
+	if c.keyResolver == nil {
+		t.Error("keyResolver should be auto-created when neither WithKeyResolver nor WithProviderURL is passed")
+	}
+	if c.providerResolver == nil {
+		t.Error("providerResolver should be auto-created (RegistryKeyResolver implements both)")
+	}
+}
+
+func TestNew_SkipsAutoResolverWhenProviderURLSet(t *testing.T) {
+	c := New("key", WithProviderURL("https://localhost:8080"))
+	if c.keyResolver != nil {
+		t.Error("keyResolver should not be auto-created when WithProviderURL is set (dev mode bypass)")
+	}
+}
+
+func TestWithRegistries_SetsList(t *testing.T) {
+	c := New("key", WithRegistries([]string{"https://reg-a.example.com", "https://reg-b.example.com"}))
+	if len(c.registryURLs) != 2 {
+		t.Fatalf("registryURLs len = %d", len(c.registryURLs))
+	}
+	if c.registryURLs[0] != "https://reg-a.example.com" {
+		t.Errorf("first registry = %q", c.registryURLs[0])
+	}
+}
+
+// WithProviderResolverForTest is a test-only Option to inject a resolver into
+// the client without going through the registry HTTP path. Lives in the test
+// file so production code stays clean.
+func WithProviderResolverForTest(pr ProviderResolver) Option {
+	return func(c *Client) { c.providerResolver = pr }
 }
