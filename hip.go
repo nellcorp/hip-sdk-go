@@ -22,6 +22,15 @@ import (
 	"time"
 )
 
+// DefaultRegistryURL is the canonical HIP registry URL compiled into the SDK.
+// SDK consumers SHOULD NOT override this in production; the URL is part of
+// the protocol's bootstrap trust anchor (PROTOCOL.md §10.8). Override only for
+// development, staging, or federation testing.
+const DefaultRegistryURL = "https://registry.humanidentity.io"
+
+// DefaultRegistryCacheTTL is the default cache TTL for registry-fetched data.
+const DefaultRegistryCacheTTL = 24 * time.Hour
+
 // VerifyRequest is sent by platforms to verify a human.
 type VerifyRequest struct {
 	SubjectID    string `json:"subject_id"`
@@ -71,13 +80,80 @@ type KeyResolver interface {
 	ResolvePublicKey(ctx context.Context, providerID string) (ed25519.PublicKey, error)
 }
 
+// ProviderEntry is the HIP/1.1 registry shape for a provider entry. The SDK
+// reads protocol endpoint URLs from this struct via the accessor methods.
+type ProviderEntry struct {
+	ID                     string            `json:"id"`
+	DisplayName            string            `json:"display_name"`
+	Domain                 string            `json:"domain"`
+	Tier                   string            `json:"tier"`
+	Status                 string            `json:"status"`
+	PublicKey              string            `json:"public_key"`
+	CertificateFingerprint string            `json:"certificate_fingerprint"`
+	Endpoints              ProviderEndpoints `json:"endpoints"`
+	Apps                   ProviderApps      `json:"apps,omitempty"`
+	PeerRegistries         []string          `json:"peer_registries,omitempty"`
+	WellKnownURL           string            `json:"well_known_url,omitempty"` // DEPRECATED — removed in HIP/1.3
+	EntrySignature         string            `json:"entry_signature,omitempty"`
+}
+
+// ProviderEndpoints lists the HIP/1.1 protocol surfaces.
+type ProviderEndpoints struct {
+	Verify         string `json:"verify"`
+	Exchange       string `json:"exchange"`
+	OAuthAuthorize string `json:"oauth_authorize"`
+	OAuthToken     string `json:"oauth_token"`
+}
+
+// ProviderApps lists end-user-facing surfaces.
+type ProviderApps struct {
+	Identity string `json:"identity,omitempty"`
+	Provider string `json:"provider,omitempty"`
+}
+
+// VerifyURL returns the resolved verify endpoint URL with HIP/1.0 fallback.
+func (p *ProviderEntry) VerifyURL() string {
+	if p.Endpoints.Verify != "" {
+		return p.Endpoints.Verify
+	}
+	if p.WellKnownURL != "" {
+		return strings.TrimRight(p.WellKnownURL, "/") + "/verify"
+	}
+	return ""
+}
+
+// ExchangeURL returns the resolved exchange endpoint URL with HIP/1.0 fallback.
+func (p *ProviderEntry) ExchangeURL() string {
+	if p.Endpoints.Exchange != "" {
+		return p.Endpoints.Exchange
+	}
+	if p.WellKnownURL != "" {
+		return strings.TrimRight(p.WellKnownURL, "/") + "/exchange"
+	}
+	return ""
+}
+
+// OAuthAuthorizeURL returns the resolved OAuth authorize URL.
+func (p *ProviderEntry) OAuthAuthorizeURL() string { return p.Endpoints.OAuthAuthorize }
+
+// OAuthTokenURL returns the resolved OAuth token endpoint URL.
+func (p *ProviderEntry) OAuthTokenURL() string { return p.Endpoints.OAuthToken }
+
+// ProviderResolver fetches the full registry entry for a provider. The
+// embedded RegistryKeyResolver implements both interfaces.
+type ProviderResolver interface {
+	ResolveProvider(ctx context.Context, providerID string) (*ProviderEntry, error)
+}
+
 // Client is a HIP SDK client for verifying human identities.
 // Safe for concurrent use.
 type Client struct {
-	httpClient      *http.Client
-	keyResolver     KeyResolver
-	apiKey          string
-	providerBaseURL string // override for testing/local dev — skips URL derivation from subject ID
+	httpClient       *http.Client
+	keyResolver      KeyResolver
+	providerResolver ProviderResolver // optional; same impl as keyResolver in production
+	apiKey           string
+	providerBaseURL  string // override for testing/local dev — skips registry lookup
+	registryURLs     []string
 }
 
 // Option configures a Client.
@@ -88,29 +164,69 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
 
-// WithKeyResolver sets a custom key resolver.
+// WithKeyResolver sets a custom key resolver. If the resolver also
+// implements ProviderResolver, registry-driven service discovery is enabled.
 func WithKeyResolver(kr KeyResolver) Option {
-	return func(c *Client) { c.keyResolver = kr }
+	return func(c *Client) {
+		c.keyResolver = kr
+		if pr, ok := kr.(ProviderResolver); ok {
+			c.providerResolver = pr
+		}
+	}
 }
 
 // WithProviderURL overrides the auto-discovered provider URL.
 // Useful for testing or when the provider uses a non-standard URL.
-// The SDK will POST to {providerURL}/verify instead of deriving
-// the URL from the subject ID.
+// The SDK will POST to {providerURL}/verify instead of fetching the
+// registry entry. Bypasses HIP/1.1 service discovery entirely.
 func WithProviderURL(url string) Option {
 	return func(c *Client) { c.providerBaseURL = url }
+}
+
+// WithRegistryURL sets a single registry URL the SDK should consult for
+// service discovery. Convenience wrapper around WithRegistries for the
+// common case of one registry. v2 federation will accept the multi-URL
+// form via WithRegistries.
+func WithRegistryURL(url string) Option {
+	return WithRegistries([]string{url})
+}
+
+// WithRegistries sets the priority-ordered list of registries the SDK
+// consults for service discovery. Defaults to the single canonical registry
+// in DefaultRegistryURL. v2 federation will resolve through this list in
+// order, falling back to compiled-in trusted roots when none are reachable.
+func WithRegistries(urls []string) Option {
+	return func(c *Client) {
+		c.registryURLs = append([]string(nil), urls...)
+	}
 }
 
 // New creates a HIP SDK client. apiKey is the `hip_sk_…` secret issued by the
 // provider for the platform. The SDK sends it as a Bearer token on every
 // request; the provider derives the platform from the key.
+//
+// If WithKeyResolver is not provided, the SDK auto-creates a
+// RegistryKeyResolver pointed at the first entry of WithRegistries (default:
+// DefaultRegistryURL). This is the recommended setup for production
+// platforms — registry-driven discovery is the HIP/1.1 default.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		apiKey:     apiKey,
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		apiKey:       apiKey,
+		registryURLs: []string{DefaultRegistryURL},
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	// Auto-create the registry-backed resolver only when the caller has not
+	// supplied their own key resolver and is not bypassing the registry via
+	// WithProviderURL (single-host dev mode). Tests + local stubs that set
+	// WithProviderURL but no key resolver keep the existing
+	// "skip signature verification" behaviour.
+	if c.keyResolver == nil && c.providerBaseURL == "" && len(c.registryURLs) > 0 {
+		resolver := NewRegistryKeyResolver(c.registryURLs[0], DefaultRegistryCacheTTL)
+		c.keyResolver = resolver
+		c.providerResolver = resolver
 	}
 	return c
 }
@@ -134,12 +250,7 @@ func (c *Client) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, 
 		return nil, err
 	}
 
-	var verifyURL string
-	if c.providerBaseURL != "" {
-		verifyURL = c.providerBaseURL + "/verify"
-	} else {
-		verifyURL = "https://" + providerID + "/.well-known/hip/verify"
-	}
+	verifyURL := c.resolveVerifyURL(ctx, providerID)
 
 	// Auto-generate nonce if not provided.
 	if req.Nonce == "" {
@@ -347,23 +458,24 @@ type OAuthTokenResponse struct {
 //	// save flow.Verifier in the user's session
 //	// redirect to flow.AuthorizeURL
 func (c *Client) StartOAuth(opts OAuthStartOptions) (*OAuthFlow, error) {
+	return c.StartOAuthCtx(context.Background(), opts)
+}
+
+// StartOAuthCtx is the context-aware variant of StartOAuth. Use this when the
+// SDK is configured for HIP/1.1 registry discovery so the registry lookup
+// honours your context's deadline / cancellation.
+func (c *Client) StartOAuthCtx(ctx context.Context, opts OAuthStartOptions) (*OAuthFlow, error) {
 	if opts.ClientID == "" {
 		return nil, fmt.Errorf("hip: ClientID is required")
 	}
 	if opts.RedirectURI == "" {
 		return nil, fmt.Errorf("hip: RedirectURI is required")
 	}
-	base := c.providerBaseURL
-	if base == "" {
-		if opts.ProviderDomain == "" {
-			return nil, fmt.Errorf("hip: ProviderDomain is required (or configure the client with WithProviderURL)")
-		}
-		base = "https://" + opts.ProviderDomain
+
+	authorizeURL, err := c.resolveOAuthAuthorizeURL(ctx, opts.ProviderDomain)
+	if err != nil {
+		return nil, err
 	}
-	// `base` points at the provider root; /oauth/authorize lives alongside /.well-known/hip.
-	// If the caller supplied a /.well-known/hip URL via WithProviderURL, strip it.
-	base = strings.TrimSuffix(base, "/.well-known/hip")
-	base = strings.TrimSuffix(base, "/")
 
 	verifier, err := generateCodeVerifier()
 	if err != nil {
@@ -381,10 +493,34 @@ func (c *Client) StartOAuth(opts OAuthStartOptions) (*OAuthFlow, error) {
 		q.Set("state", opts.State)
 	}
 
+	separator := "?"
+	if strings.Contains(authorizeURL, "?") {
+		separator = "&"
+	}
+
 	return &OAuthFlow{
-		AuthorizeURL: base + "/oauth/authorize?" + q.Encode(),
+		AuthorizeURL: authorizeURL + separator + q.Encode(),
 		Verifier:     verifier,
 	}, nil
+}
+
+// resolveOAuthAuthorizeURL returns the OAuth authorize URL with the priority
+// chain: WithProviderURL override → registry endpoints.oauth_authorize →
+// HIP/1.0 fallback (https://{providerDomain}/oauth/authorize).
+func (c *Client) resolveOAuthAuthorizeURL(ctx context.Context, providerDomain string) (string, error) {
+	if c.providerBaseURL != "" {
+		base := strings.TrimSuffix(strings.TrimSuffix(c.providerBaseURL, "/.well-known/hip"), "/")
+		return base + "/oauth/authorize", nil
+	}
+	if providerDomain == "" {
+		return "", fmt.Errorf("hip: ProviderDomain is required (or configure the client with WithProviderURL)")
+	}
+	if entry, _ := c.resolveProvider(ctx, providerDomain); entry != nil {
+		if u := entry.OAuthAuthorizeURL(); u != "" {
+			return u, nil
+		}
+	}
+	return "https://" + providerDomain + "/oauth/authorize", nil
 }
 
 // CompleteOAuth exchanges an authorization code + PKCE verifier for a
@@ -405,15 +541,10 @@ func (c *Client) CompleteOAuth(ctx context.Context, code, verifier string, opts 
 	if opts.ClientID == "" {
 		return nil, fmt.Errorf("hip: ClientID is required")
 	}
-	base := c.providerBaseURL
-	if base == "" {
-		if opts.ProviderDomain == "" {
-			return nil, fmt.Errorf("hip: ProviderDomain is required")
-		}
-		base = "https://" + opts.ProviderDomain
+	tokenURL, err := c.resolveOAuthTokenURL(ctx, opts.ProviderDomain)
+	if err != nil {
+		return nil, err
 	}
-	base = strings.TrimSuffix(base, "/.well-known/hip")
-	base = strings.TrimSuffix(base, "/")
 
 	body, err := json.Marshal(map[string]string{
 		"grant_type":    "authorization_code",
@@ -425,7 +556,7 @@ func (c *Client) CompleteOAuth(ctx context.Context, code, verifier string, opts 
 		return nil, fmt.Errorf("hip: marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/oauth/token", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("hip: creating request: %w", err)
 	}
@@ -484,6 +615,72 @@ func (c *Client) resolveKeyWithStaleFlag(ctx context.Context, providerID string)
 	}
 	key, err := c.keyResolver.ResolvePublicKey(ctx, providerID)
 	return key, false, err
+}
+
+// resolveProvider fetches the provider entry via the configured resolver.
+// Returns nil + nil error when no provider resolver is configured (HIP/1.0
+// fallback path; callers must derive URLs via string concat).
+func (c *Client) resolveProvider(ctx context.Context, providerID string) (*ProviderEntry, error) {
+	if c.providerResolver == nil {
+		return nil, nil
+	}
+	return c.providerResolver.ResolveProvider(ctx, providerID)
+}
+
+// resolveVerifyURL returns the verify endpoint for a provider. Priority:
+//  1. WithProviderURL explicit override (dev/test).
+//  2. Registry-discovered endpoints.verify (HIP/1.1).
+//  3. Legacy string-concat fallback (HIP/1.0).
+func (c *Client) resolveVerifyURL(ctx context.Context, providerID string) string {
+	if c.providerBaseURL != "" {
+		return c.providerBaseURL + "/verify"
+	}
+	if entry, _ := c.resolveProvider(ctx, providerID); entry != nil {
+		if u := entry.VerifyURL(); u != "" {
+			return u
+		}
+	}
+	return "https://" + providerID + "/.well-known/hip/verify"
+}
+
+// resolveExchangeURL returns the exchange endpoint with the same priority chain.
+func (c *Client) resolveExchangeURL(ctx context.Context, providerID string) string {
+	if c.providerBaseURL != "" {
+		return c.providerBaseURL + "/exchange"
+	}
+	if entry, _ := c.resolveProvider(ctx, providerID); entry != nil {
+		if u := entry.ExchangeURL(); u != "" {
+			return u
+		}
+	}
+	return "https://" + providerID + "/.well-known/hip/exchange"
+}
+
+// resolveOAuthBase returns the base URL used for /oauth/* paths in the
+// HIP/1.0 fallback, when the registry entry is unavailable.
+func (c *Client) resolveOAuthBase(providerID string) string {
+	if c.providerBaseURL != "" {
+		return strings.TrimSuffix(strings.TrimSuffix(c.providerBaseURL, "/.well-known/hip"), "/")
+	}
+	return "https://" + providerID
+}
+
+// resolveOAuthTokenURL returns the OAuth token URL with the same priority
+// chain as resolveOAuthAuthorizeURL.
+func (c *Client) resolveOAuthTokenURL(ctx context.Context, providerDomain string) (string, error) {
+	if c.providerBaseURL != "" {
+		base := strings.TrimSuffix(strings.TrimSuffix(c.providerBaseURL, "/.well-known/hip"), "/")
+		return base + "/oauth/token", nil
+	}
+	if providerDomain == "" {
+		return "", fmt.Errorf("hip: ProviderDomain is required")
+	}
+	if entry, _ := c.resolveProvider(ctx, providerDomain); entry != nil {
+		if u := entry.OAuthTokenURL(); u != "" {
+			return u, nil
+		}
+	}
+	return "https://" + providerDomain + "/oauth/token", nil
 }
 
 // generateNonce creates a cryptographically random 32-byte nonce encoded as base64url.
@@ -561,19 +758,26 @@ func ParsePEMPublicKey(pemData string) (ed25519.PublicKey, error) {
 
 // --- Registry-backed key resolver ---
 
-// RegistryKeyResolver resolves provider public keys from the HIP registry
-// with in-memory caching and last-known-good fallback.
+// RegistryKeyResolver resolves provider public keys AND full provider entries
+// from the HIP registry with in-memory caching and last-known-good fallback.
+// Implements both KeyResolver and ProviderResolver.
 type RegistryKeyResolver struct {
 	registryURL string
 	httpClient  *http.Client
 	ttl         time.Duration
 
-	mu    sync.RWMutex
-	cache map[string]*cachedKey
+	mu            sync.RWMutex
+	cache         map[string]*cachedKey
+	providerCache map[string]*cachedProvider
 }
 
 type cachedKey struct {
 	key       ed25519.PublicKey
+	fetchedAt time.Time
+}
+
+type cachedProvider struct {
+	entry     ProviderEntry
 	fetchedAt time.Time
 }
 
@@ -584,11 +788,70 @@ func NewRegistryKeyResolver(registryURL string, ttl time.Duration, httpClient ..
 		hc = httpClient[0]
 	}
 	return &RegistryKeyResolver{
-		registryURL: registryURL,
-		httpClient:  hc,
-		ttl:         ttl,
-		cache:       make(map[string]*cachedKey),
+		registryURL:   registryURL,
+		httpClient:    hc,
+		ttl:           ttl,
+		cache:         make(map[string]*cachedKey),
+		providerCache: make(map[string]*cachedProvider),
 	}
+}
+
+// ResolveProvider fetches the full HIP/1.1 provider entry from the registry
+// with caching + last-known-good fallback. Returns the most recent successful
+// fetch when the registry is unreachable.
+func (r *RegistryKeyResolver) ResolveProvider(ctx context.Context, providerID string) (*ProviderEntry, error) {
+	r.mu.RLock()
+	cached := r.providerCache[providerID]
+	r.mu.RUnlock()
+
+	if cached != nil && time.Since(cached.fetchedAt) < r.ttl {
+		entry := cached.entry
+		return &entry, nil
+	}
+
+	url := fmt.Sprintf("%s/providers/%s", r.registryURL, providerID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		if cached != nil {
+			entry := cached.entry
+			return &entry, nil
+		}
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		if cached != nil {
+			entry := cached.entry
+			return &entry, nil
+		}
+		return nil, fmt.Errorf("hip: registry request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		if cached != nil {
+			entry := cached.entry
+			return &entry, nil
+		}
+		return nil, fmt.Errorf("hip: registry returned %d for provider %s", resp.StatusCode, providerID)
+	}
+
+	var entry ProviderEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entry); err != nil {
+		if cached != nil {
+			cachedEntry := cached.entry
+			return &cachedEntry, nil
+		}
+		return nil, fmt.Errorf("hip: decoding provider entry: %w", err)
+	}
+
+	r.mu.Lock()
+	r.providerCache[providerID] = &cachedProvider{entry: entry, fetchedAt: time.Now()}
+	r.mu.Unlock()
+
+	return &entry, nil
 }
 
 // ResolvePublicKey fetches the provider's public key from the registry,
