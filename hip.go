@@ -82,6 +82,11 @@ type KeyResolver interface {
 
 // ProviderEntry is the HIP/1.1 registry shape for a provider entry. The SDK
 // reads protocol endpoint URLs from this struct via the accessor methods.
+//
+// Per PROTOCOL.md §10.9, registry responses are JWS-signed by a separate
+// registry root key — there is no per-entry signature field. RegistryKey-
+// Resolver verifies the JWS at the response layer before returning a
+// ProviderEntry.
 type ProviderEntry struct {
 	ID                     string            `json:"id"`
 	DisplayName            string            `json:"display_name"`
@@ -89,12 +94,16 @@ type ProviderEntry struct {
 	Tier                   string            `json:"tier"`
 	Status                 string            `json:"status"`
 	PublicKey              string            `json:"public_key"`
+	PublicKeyID            string            `json:"public_key_id,omitempty"`
+	PendingPublicKey       string            `json:"pending_public_key,omitempty"`
+	PendingPublicKeyID     string            `json:"pending_public_key_id,omitempty"`
+	SupportedDocuments     []string          `json:"supported_document_types,omitempty"`
+	SupportedCountries     []string          `json:"supported_countries,omitempty"`
 	CertificateFingerprint string            `json:"certificate_fingerprint"`
 	Endpoints              ProviderEndpoints `json:"endpoints"`
 	Apps                   ProviderApps      `json:"apps,omitempty"`
-	PeerRegistries         []string          `json:"peer_registries,omitempty"`
+	PeerRegistries         []string          `json:"peer_registries"`
 	WellKnownURL           string            `json:"well_known_url,omitempty"` // DEPRECATED — removed in HIP/1.3
-	EntrySignature         string            `json:"entry_signature,omitempty"`
 }
 
 // ProviderEndpoints lists the HIP/1.1 protocol surfaces.
@@ -154,6 +163,7 @@ type Client struct {
 	apiKey           string
 	providerBaseURL  string // override for testing/local dev — skips registry lookup
 	registryURLs     []string
+	registryRootKey  ed25519.PublicKey // pins registry response JWS verification per §10.8
 }
 
 // Option configures a Client.
@@ -201,6 +211,21 @@ func WithRegistries(urls []string) Option {
 	}
 }
 
+// WithRegistryRootKey pins the Ed25519 public key used to verify JWS-signed
+// registry responses (PROTOCOL.md §10.8 + §10.9). Production SDK consumers
+// SHOULD pin a key; without one, the SDK accepts plain-JSON registry
+// responses without signature verification (intended for dev/test only).
+//
+// The SDK ships with DefaultRegistryRootKey as a placeholder; once a prod
+// root key is generated and rotated, the constant becomes load-bearing and
+// SDK releases ship updated keys with overlap windows per the rotation
+// procedure in §10.8.
+func WithRegistryRootKey(key ed25519.PublicKey) Option {
+	return func(c *Client) {
+		c.registryRootKey = key
+	}
+}
+
 // New creates a HIP SDK client. apiKey is the `hip_sk_…` secret issued by the
 // provider for the platform. The SDK sends it as a Bearer token on every
 // request; the provider derives the platform from the key.
@@ -225,6 +250,7 @@ func New(apiKey string, opts ...Option) *Client {
 	// "skip signature verification" behaviour.
 	if c.keyResolver == nil && c.providerBaseURL == "" && len(c.registryURLs) > 0 {
 		resolver := NewRegistryKeyResolver(c.registryURLs[0], DefaultRegistryCacheTTL)
+		resolver.SetRegistryRootKey(c.registryRootKey)
 		c.keyResolver = resolver
 		c.providerResolver = resolver
 	}
@@ -765,10 +791,18 @@ type RegistryKeyResolver struct {
 	registryURL string
 	httpClient  *http.Client
 	ttl         time.Duration
+	rootKey     ed25519.PublicKey // optional; when set, JWS responses are verified
 
 	mu            sync.RWMutex
 	cache         map[string]*cachedKey
 	providerCache map[string]*cachedProvider
+}
+
+// SetRegistryRootKey pins the Ed25519 public key used to verify JWS-signed
+// registry responses. When unset, the resolver accepts plain-JSON responses
+// without signature verification (intended for dev / local stubs).
+func (r *RegistryKeyResolver) SetRegistryRootKey(key ed25519.PublicKey) {
+	r.rootKey = key
 }
 
 type cachedKey struct {
@@ -810,7 +844,7 @@ func (r *RegistryKeyResolver) ResolveProvider(ctx context.Context, providerID st
 	}
 
 	url := fmt.Sprintf("%s/providers/%s", r.registryURL, providerID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	payload, err := r.fetchAndUnwrap(ctx, url)
 	if err != nil {
 		if cached != nil {
 			entry := cached.entry
@@ -818,28 +852,9 @@ func (r *RegistryKeyResolver) ResolveProvider(ctx context.Context, providerID st
 		}
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		if cached != nil {
-			entry := cached.entry
-			return &entry, nil
-		}
-		return nil, fmt.Errorf("hip: registry request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		if cached != nil {
-			entry := cached.entry
-			return &entry, nil
-		}
-		return nil, fmt.Errorf("hip: registry returned %d for provider %s", resp.StatusCode, providerID)
-	}
 
 	var entry ProviderEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entry); err != nil {
+	if err := json.Unmarshal(payload, &entry); err != nil {
 		if cached != nil {
 			cachedEntry := cached.entry
 			return &cachedEntry, nil
@@ -874,35 +889,18 @@ func (r *RegistryKeyResolver) resolvePublicKeyWithStaleFlag(ctx context.Context,
 
 	// Fetch from registry.
 	url := fmt.Sprintf("%s/providers/%s/certificate", r.registryURL, providerID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	payload, err := r.fetchAndUnwrap(ctx, url)
 	if err != nil {
 		if cached != nil {
 			return cached.key, true, nil // stale fallback
 		}
 		return nil, false, err
 	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		if cached != nil {
-			return cached.key, true, nil // stale fallback
-		}
-		return nil, false, fmt.Errorf("hip: registry request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		if cached != nil {
-			return cached.key, true, nil // stale fallback
-		}
-		return nil, false, fmt.Errorf("hip: registry returned %d for %s", resp.StatusCode, providerID)
-	}
 
 	var certResp struct {
 		PublicKey string `json:"public_key"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&certResp); err != nil {
+	if err := json.Unmarshal(payload, &certResp); err != nil {
 		if cached != nil {
 			return cached.key, true, nil // stale fallback
 		}
@@ -922,4 +920,57 @@ func (r *RegistryKeyResolver) resolvePublicKeyWithStaleFlag(ctx context.Context,
 	r.mu.Unlock()
 
 	return pubKey, false, nil
+}
+
+// fetchAndUnwrap fetches the given URL from the registry and returns the
+// payload bytes ready for JSON decoding. When the response body is a JWS
+// compact serialization (Content-Type: application/jose) and a registry root
+// key is pinned, the JWS signature is verified and the payload is extracted.
+// Otherwise the body is returned verbatim.
+func (r *RegistryKeyResolver) fetchAndUnwrap(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/jose, application/json;q=0.5")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("hip: registry request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("hip: registry returned %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("hip: reading registry body: %w", err)
+	}
+
+	// JWS path: response is application/jose AND we have a pinned root key.
+	if isJOSEContentType(resp.Header.Get("Content-Type")) && r.rootKey != nil {
+		payload, err := verifyJWS(r.rootKey, strings.TrimSpace(string(body)))
+		if err != nil {
+			return nil, fmt.Errorf("hip: registry JWS verify: %w", err)
+		}
+		return payload, nil
+	}
+
+	// Plain-JSON path (legacy / dev). Returned as-is.
+	return body, nil
+}
+
+// isJOSEContentType reports whether the given Content-Type value indicates a
+// JWS compact serialization. Tolerates trailing parameters (e.g.
+// "application/jose; charset=utf-8").
+func isJOSEContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	if i := strings.Index(ct, ";"); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "application/jose")
 }

@@ -597,3 +597,112 @@ func TestWithRegistries_SetsList(t *testing.T) {
 func WithProviderResolverForTest(pr ProviderResolver) Option {
 	return func(c *Client) { c.providerResolver = pr }
 }
+
+// TestRegistryKeyResolver_JWSResponse exercises the HIP/1.1 JWS-everywhere
+// path: when the registry returns application/jose and the resolver has a
+// pinned root key, the body is verified before the payload is parsed.
+func TestRegistryKeyResolver_JWSResponse(t *testing.T) {
+	rootPub, rootPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	pub, _ := generateTestKeyPair(t)
+	pemKey := encodePEMPublicKey(pub)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := json.Marshal(map[string]string{"public_key": pemKey})
+		jws := signJWSForTest(t, rootPriv, body)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
+	}))
+	defer srv.Close()
+
+	resolver := NewRegistryKeyResolver(srv.URL, 24*time.Hour)
+	resolver.SetRegistryRootKey(rootPub)
+
+	key, err := resolver.ResolvePublicKey(context.Background(), "test.com")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !pub.Equal(key) {
+		t.Fatal("resolved key doesn't match")
+	}
+}
+
+// TestRegistryKeyResolver_JWSBadSignature verifies that a tampered JWS body
+// is rejected. The resolver MUST NOT trust the payload when the signature
+// fails to verify against the pinned root key.
+func TestRegistryKeyResolver_JWSBadSignature(t *testing.T) {
+	rootPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen rootPub: %v", err)
+	}
+	_, attackerPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen attackerPriv: %v", err)
+	}
+	pub, _ := generateTestKeyPair(t)
+	pemKey := encodePEMPublicKey(pub)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := json.Marshal(map[string]string{"public_key": pemKey})
+		// JWS signed by an attacker (NOT the pinned rootPub).
+		jws := signJWSForTest(t, attackerPriv, body)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
+	}))
+	defer srv.Close()
+
+	resolver := NewRegistryKeyResolver(srv.URL, 24*time.Hour)
+	resolver.SetRegistryRootKey(rootPub)
+
+	_, err = resolver.ResolvePublicKey(context.Background(), "tampered.com")
+	if err == nil {
+		t.Fatal("expected JWS verify error, got nil")
+	}
+	if !strings.Contains(err.Error(), "JWS verify") {
+		t.Fatalf("expected JWS verify error, got: %v", err)
+	}
+}
+
+// TestRegistryKeyResolver_ResolveProvider_JWS exercises the same JWS-
+// verification path on the full provider-entry endpoint.
+func TestRegistryKeyResolver_ResolveProvider_JWS(t *testing.T) {
+	rootPub, rootPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+
+	entry := ProviderEntry{
+		ID:     "humanidentity.io",
+		Domain: "humanidentity.io",
+		Endpoints: ProviderEndpoints{
+			Verify:         "https://api.humanidentity.io/.well-known/hip/verify",
+			OAuthAuthorize: "https://humanidentity.io/oauth/authorize",
+			OAuthToken:     "https://api.humanidentity.io/oauth/token",
+		},
+		PeerRegistries: []string{},
+	}
+	body, _ := json.Marshal(entry)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jws := signJWSForTest(t, rootPriv, body)
+		w.Header().Set("Content-Type", "application/jose")
+		_, _ = w.Write([]byte(jws))
+	}))
+	defer srv.Close()
+
+	resolver := NewRegistryKeyResolver(srv.URL, 24*time.Hour)
+	resolver.SetRegistryRootKey(rootPub)
+
+	got, err := resolver.ResolveProvider(context.Background(), "humanidentity.io")
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if got.Endpoints.Verify != entry.Endpoints.Verify {
+		t.Fatalf("Verify URL = %q", got.Endpoints.Verify)
+	}
+	if got.Endpoints.OAuthAuthorize != entry.Endpoints.OAuthAuthorize {
+		t.Fatalf("OAuthAuthorize URL = %q", got.Endpoints.OAuthAuthorize)
+	}
+}
