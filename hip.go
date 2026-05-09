@@ -236,9 +236,10 @@ func WithRegistryRootKey(key ed25519.PublicKey) Option {
 // platforms — registry-driven discovery is the HIP/1.1 default.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
-		apiKey:       apiKey,
-		registryURLs: []string{DefaultRegistryURL},
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		apiKey:          apiKey,
+		registryURLs:    []string{DefaultRegistryURL},
+		registryRootKey: DefaultRegistryRootKey, // PROTOCOL.md §10.8 compile-time anchor; WithRegistryRootKey overrides.
 	}
 	for _, opt := range opts {
 		opt(c)
